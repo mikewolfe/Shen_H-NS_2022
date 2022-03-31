@@ -1,0 +1,552 @@
+---
+title: "Predicting bp-level H-NS binding from footprinting data"
+author: "Mike Wolfe"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, 
+                      warning = FALSE, fig.align = "center")
+```
+
+```{r}
+library(tidyverse)
+library(ggridges)
+library(glmnet)
+library(caret)
+library(ggbeeswarm)
+library(PRROC)
+library(patchwork)
+theme_set(theme_bw(base_size = 8))
+set.seed(42)
+```
+
+# Motivation
+
+We wanted to try to use some of the footprinting data that we and others have
+gathered to make a statistical model to predict H-NS binding at the basepair
+level using a combination of sequence and predicted structural parameters.
+
+Beth had gathered the sequence and identified footprinting locations from four
+different papers including our own.
+
+- `bgl_Shen2021` - our data combining information between MD, traditional
+footprinting, and TEN-map to get a picture of where the DBD is bound.
+- `bolA_Moreira_2011` - footprinting data using DNaseI cleavage and full length
+H-NS
+- `proU_Lucht2014` - footprinting data using DNaseI cleavage and full length
+H-NS
+- `virF_Ulissi2014` - footprinting data using OH radical footprinting with full
+length and CTD only H-NS.
+
+Many of these binding sites were differentiated by strand including in our own
+manuscript. However, for the purposes of the modeling below I have collapsed
+everything to an integer number of overlapping binding sites at a given
+basepair. Note that this initial set of binding locations for the Shen data is
+preliminary. I updated the binding calls for the Shen data before running the
+final model below.
+
+```{r}
+binding <- read_tsv("tidy_binding.tsv")
+```
+
+```{r}
+binding %>% ggplot(aes(x = coord, y = value)) + geom_line() +
+    theme_bw() +
+    facet_wrap(~contig, ncol = 1, scales = "free") +
+  labs(y = "# of overlapping binding sites", x = "bp in sequence", title = "H-NS footprint datasets")
+```
+
+The overall pattern of binding and spacing looks decently similar between these
+datasets. Reminder that I am not considering strandedness here.
+
+# DNA sequence parameters
+
+We have seen in other manuscripts people look at TA-steps or A-tracts together
+with AT content as correlated with H-NS binding.  Here I have taken those same
+parameters and digitized them at the basepair level so that they are represented
+as an integer value for the number of TA-steps, A-tracts, or Lang et al. motifs
+that overlap a given position.
+```{r}
+seq_dat <- read_tsv("tidy_seq_data.tsv")
+# add sequence data to binding data
+all <- bind_rows(binding, seq_dat)
+```
+
+```{r}
+(p1 <- all %>% 
+  mutate(param = str_replace(param, "_", " ")) %>%
+  mutate(param = str_replace(param, "lang", "Lang")) %>%
+  mutate(param = as.factor(param)) %>%
+  mutate(param = fct_relevel(param, 
+                                   c("binding", "TA step", "A tract",
+                                     "Lang motif"))) %>%
+  mutate(contig = str_replace(contig, "bgl_Shen2021", "bgl"),
+         contig = str_replace(contig, "bolA_Moreira2011", "bolA Moreira 2011"),
+         contig = str_replace(contig, "proU_Lucht2014", "proU Lucht 2014"),
+         contig = str_replace(contig, "virF_Ulissi2014", "virF Ulissi 2014")) %>%
+    ggplot(aes(x = coord, y = value, color = param)) + 
+    geom_line(show.legend = FALSE) +
+    facet_grid(cols = vars(contig), rows = vars(param), scales= "free") + 
+    scale_color_manual(values = c("black", "forestgreen", "royalblue", "purple")) + 
+    theme_bw() + labs(y = "# of Overlapping Sites", x = "bp in sequence", title = "H-NS DBD footprinting coincides with sequence features"))
+```
+
+Seems like there is some correspondance between sequence features and binding
+sites but it is hard to tell from this simple plot.
+
+# DNA shape parameters
+
+We also wanted to include DNA shape parameters as calculated from Monte Carlo
+simulations on k-mer sequences. These simulations have been benchmarked using
+structures of DNA determined from X-ray crystallography data (Chiu et al. 2016,
+Li et al. 2017) I have included the following shape features by running the
+`DNAshapeR` program on each of the sequences:
+
+- MGW - Minor Groove Width
+- HelT - Helical Twist
+- Roll 
+- EP - Electrostatic potential
+- ProT - Propeller Twist
+
+```{r}
+shape <- read_tsv("all_shape_all_seqs.tsv")
+shape_vis <- bind_rows(binding, shape)
+```
+
+```{r}
+shape_vis %>% mutate(param = fct_relevel(param, 
+                                   c("binding", "MGW", "EP", "HelT",
+                                     "Roll", "ProT"))) %>%
+    ggplot(aes(x = coord, y = value, color = param)) + 
+    geom_line(show.legend = FALSE) +
+    facet_grid(cols = vars(contig), rows = vars(param), scales= "free") + 
+    scale_color_manual(values = c("black", 
+                                  "forestgreen", 
+                                  "royalblue", "purple", "red", "orange")) + 
+    theme_bw() + labs(title = "Binding vs. Structure", x = "Coordinate", y = "")
+```
+
+It is even more difficult to tell whether there is any correspondence between
+DNA shape features and the binding locations on these sequences.
+
+# Combining the data
+```{r}
+all <- bind_rows(seq_dat, binding, shape)
+```
+
+```{r}
+all <- all %>% pivot_wider(names_from = param, values_from = value) 
+```
+Let's see if there are clear shifts in the distribution of each of these
+parameters between basepairs that are protected or in binding locations vs.
+those that are not. Here I have converted the binding variable into FALSE if the
+basepair doesn't not overlap with a protected site and TRUE if it does.
+
+```{r}
+all %>% pivot_longer(-c("contig", "coord", "binding"), names_to = "param", values_to = "value") %>% 
+    ggplot(aes(x = value, y = binding > 0, fill = binding > 0)) + 
+    stat_density_ridges(quantile_lines = TRUE, quantiles = 2, show.legend = FALSE) +
+    facet_wrap(~param, scales = "free") + theme_bw() +
+    labs(title = "All data")
+```
+
+# Modeling H-NS binding at the basepair level
+
+Let's do some logistic regression to see if we can predict binding from this
+data. What we are going to do is to model binding as a binomial process and
+use the predictors to determine the probability of being bound. Mathematically
+this looks something like this:
+
+$$
+\begin{aligned}
+  \text{binding}_i \sim \text{binomial}(p_i, n = 1) \\
+  \text{logit}(p) = \alpha + \beta_k k_i + ...
+\end{aligned}
+$$
+
+For each basepair $i$ and each predictor $k$. We will use a LASSO procedure to
+select a minimal set of predictors that best explain the data
+(Friedman et al. 2010). Additionally we will use 10 fold
+cross-validation to assess variance in fitting from the exact data that is used
+(https://en.wikipedia.org/wiki/Cross-validation_(statistics)).
+
+
+Here we define a bunch of helper functions for plots and modeling
+```{r}
+# plot logistic regression coefficients
+prepare_coefficients <- function(cvfit, s = "lambda.1se", fold = NA){
+  c <- coef(cvfit, s = s) %>% 
+    as.matrix() %>% 
+    data.frame() %>% 
+    mutate(coef = rownames(.), value = X1) %>% 
+    mutate(log_odds = exp(value)) %>%
+    filter(coef != "(Intercept)") %>% mutate(fold = fold)
+  c
+}
+prepare_coefficients_cv <- function(cvfits, s = "lambda.1se"){
+  all_c <- list()
+  for(i in seq_along(cvfits)){
+    this.c <- prepare_coefficients(cvfits[[i]], s, fold = i)
+    all_c[[i]] <- this.c
+  }
+  all_c <- bind_rows(all_c)  
+  all_c
+}
+  
+  
+plot_coefficients <- function(cvfit, s = "lambda.1se"){
+  c <- prepare_coefficients(cvfit, s)
+  p <- c %>% mutate(coef = fct_reorder(as.factor(coef), value)) %>% 
+    ggplot(aes(x = coef, y = value, color = coef)) + 
+    geom_point(show.legend=FALSE) + theme_bw() + 
+    labs(x = "", y = "LASSO Regression Coefficient") + coord_flip() +
+    geom_hline(yintercept = 0, linetype = "dashed")
+}
+
+plot_coefficients_cv <- function(cvfits, s = "lambda.1se"){
+  all_c <- prepare_coefficients_cv(cvfits, s)
+  all_c %>% group_by(coef) %>% mutate(avg_value = mean(value)) %>% ungroup() %>%
+    mutate(coef = fct_reorder(as.factor(coef), avg_value)) %>% 
+    ggplot(aes(x = coef, y = value, color = coef)) + 
+    geom_quasirandom(show.legend=FALSE) + theme_bw() + 
+    labs(x = "", y = "Variable Importance\n(LASSO Regression Coefficient)") + coord_flip() +
+    geom_hline(yintercept = 0, linetype = "dashed")
+}
+# helper functions for transformations
+robust_z <- function(x){
+  rz <- (x - median(x)) / mad(x)
+  rz
+}
+z_score <- function(x){
+  z <- (x - mean(x))/sd(x)
+  z
+}
+
+center <- function(x){
+  c <- x- median(x)
+}
+
+convert_dataset <- function(dataset){
+    list(y = (dataset$binding > 0) %>%
+             as.numeric() %>% as.matrix(),
+         x = dataset %>% select(-contig, -coord, -binding) %>%
+             as.matrix())
+}
+
+fit_logistic <- function(dataset, k = 10, inner_k = 10){
+  dataset <- convert_dataset(dataset)
+  x <- dataset$x
+  y <- dataset$y
+  models <- list()
+  folds <- createFolds(y, k = k, list = FALSE)
+  for(i in 1:max(folds)){ 
+    inner_folds <- createFolds(y[folds != i], k = inner_k, list = FALSE)
+    this.cvfit <- cv.glmnet(x[folds != i,], y[folds != i], family = "binomial", foldid = inner_folds)
+    models[[i]] <- this.cvfit
+  }
+  
+  cvfit <- cv.glmnet(x, y, family = "binomial", foldid = folds)
+  list(total = cvfit, models = models, folds = folds)
+}
+
+plot_prc <- function(model, datasets, names, s = "lambda.1se"){
+  Xs <- list()
+  ys <- list()
+  baselines <- list()
+  for(d in seq_along(datasets)){
+    this_d <- convert_dataset(datasets[[d]])
+    Xs[[d]] <- this_d$x
+    ys[[d]] <- this_d$y
+    baselines[[d]] <- sum(this_d$y == 1) / (sum(this_d$y == 0) + sum(this_d$y == 1))
+  }
+  prc_list <- list()
+  prc_auc <- list()
+  for(i in seq_along(Xs)){
+    this_p <- predict(model, Xs[[i]], type = "response",
+                      s = s)
+    this_prc <- pr.curve(scores.class0 = this_p[ys[[i]] == 1],
+                         scores.class1 = this_p[ys[[i]] == 0],
+                         curve = TRUE)
+    prc_list[[i]] <- this_prc$curve %>% as_tibble() %>%
+      rename(Recall = V1, Precision = V2, Cutoff = V3)
+    prc_list[[i]]$data <- names[[i]]
+    prc_auc[[i]] <- this_prc$auc.davis.goadrich
+  }
+  prc_auc <- data.frame(auc = unlist(prc_auc), names = unlist(names))
+  prc_list <- prc_list %>% reduce(bind_rows)
+  baseline_list <- data.frame(baseline = unlist(baselines), data = unlist(names))
+  p <- prc_list %>%
+  ggplot(aes(x = Recall, y = Precision, color = data)) + geom_line() + 
+  theme_bw() +
+  labs(color = "Dataset", title = "Performance") +
+  geom_hline(data =baseline_list, aes(yintercept = baseline, color = data), linetype = "dashed")
+  list(p = p, auc = prc_auc)
+}
+
+cv_prc <- function(cvfits, datasets, names, s = "lambda.1se"){
+  Xs <- list()
+  ys <- list()
+  for(d in seq_along(datasets)){
+    this_d <- convert_dataset(datasets[[d]])
+    Xs[[d]] <- this_d$x
+    ys[[d]] <- this_d$y
+  }
+  prc_auc <- list()
+  k <- 1
+  for(m in seq_along(cvfits)){
+    for(i in seq_along(Xs)){
+      this_p <- predict(cvfits[[m]], Xs[[i]], type = "response",
+                        s = s)
+      this_prc <- pr.curve(scores.class0 = this_p[ys[[i]] == 1],
+                          scores.class1 = this_p[ys[[i]] == 0])
+      outdf <- data.frame(auc = this_prc$auc.davis.goadrich,
+                          model = m,
+                          data = names[[i]])
+      prc_auc[[k]] <- outdf
+      k <- k + 1
+    }
+  }
+  prc_auc <- bind_rows(prc_auc)
+  prc_auc
+}
+```
+
+
+For the sequence predictors, everything was converted to a TRUE/FALSE. That is
+if the basepair sits in a TA-step it is TRUE, otherwise it is FALSE. For the
+continuous structural parameters, each of the parameters was converted to
+a Z-score based on the values within the entire dataset.
+
+I am going to add in A/T content windowed at 5 bp as well here.
+```{r}
+(at_content <- read_tsv("all_seqs_windowed_at.tsv"))
+```
+
+Also need to Filter out locations where we don't have match data for
+```{r}
+(all_plus_at <- bind_rows(seq_dat, binding, shape, at_content) %>%
+  filter(!(contig == "bgl_Shen2021" & coord < 30 | contig == "bgl_Shen2021" & coord > 30 + 80)))
+```
+
+
+```{r}
+(all_plus_at <- all_plus_at %>% pivot_wider(names_from = param, values_from = value))
+```
+
+Here is where we Z-score and discretize everything, filtering out locations
+we don't have data for
+```{r}
+to_model_at <- all_plus_at %>% filter(complete.cases(.)) %>%
+         mutate(TA_step = TA_step > 0) %>%
+         mutate(A_tract = A_tract > 0) %>%
+         mutate(lang_motif = lang_motif > 0) %>%
+         mutate(MGW = z_score(MGW)) %>%
+         mutate(EP = z_score(EP)) %>%
+         mutate(ProT = z_score(ProT)) %>%
+         mutate(HelT = z_score(HelT)) %>%
+         mutate(`A/T_5bp` = z_score(`A/T_5bp`)) %>%
+         mutate(Roll = z_score(Roll)) 
+
+shen_at <- to_model_at %>% filter(contig == "bgl_Shen2021")
+```
+
+# Predicting data with combined p-values
+
+Ok, we want to run the models using the combined TEN-map and OH binding
+locations
+
+```{r}
+combined_bind <- read_tsv("../pvalues_calcs/combined_individ_binding.tsv") %>% 
+  group_by(bp) %>%
+  summarize(binding = sum(binding))
+```
+
+First we need to grab the shen_at data and add some updated binding locations
+```{r}
+(shen_at_combined <- 
+  shen_at %>% mutate(coord = as.integer(coord)) %>%
+   right_join(combined_bind %>% 
+               rename(coord = bp, new_binding = binding) %>%
+               mutate(coord = as.integer(coord)) %>%
+                                          select(coord, new_binding),
+                                          by = "coord") %>%
+   mutate(binding = new_binding) %>%
+   select(-new_binding)) %>%
+  ggplot(aes(x = coord, y = as.numeric(binding> 0))) + geom_line()
+shen_at_combined 
+```
+
+```{r}
+set.seed(43)
+out_shen_only_at_combined <- fit_logistic(shen_at_combined, k = 10, inner_k = 10)
+```
+
+Let's look at the coefficients for this model
+```{r}
+x_max <- 1.8
+(lcoef_plot <- prepare_coefficients_cv(out_shen_only_at_combined$models) %>%
+    bind_rows(prepare_coefficients(out_shen_only_at_combined$total, fold = -1)) %>%
+  mutate(coef = str_replace(coef,"_", " ")) %>%
+  mutate(coef = str_replace(coef, "lang", "Lang")) %>%
+  group_by(coef) %>% mutate(avg_value = mean(value)) %>%
+  ungroup() %>% 
+  mutate(coef = fct_relevel(coef, c("EP", "HelT", 
+                                    "ProT", "Roll",
+                                    "MGW", "A tract", 
+                                    "A/T 5bp", "Lang motif", 
+                                    "TA step"))) %>%
+  mutate(sign = if_else(value < 0, "−", "+")) %>%
+  mutate(type = case_when( coef %in% c("EP") ~ "Electrostatics",
+                           coef %in% c("TA step", "A/T 5bp", "A tract", "Lang motif") ~ "Sequence",
+                           TRUE ~ "Structure")) %>%
+  ggplot() +
+  geom_point(data = . %>% filter(fold == -1), 
+             aes(x = abs(value), y = coef, shape = sign), fill = "orange", size = 4) +
+  geom_quasirandom(data = . %>% filter(fold != -1), aes(y = coef, x = abs(value), shape = sign, fill = type), 
+                   dodge.width = 0.85, groupOnX = FALSE,
+                   size = 1.5) + 
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  geom_hline(yintercept = seq(from = 0.5, to = 9.5, by = 1), alpha = 0.5) +
+  theme_classic() +
+  geom_rect(data = tibble(xmin = -0.1, xmax = x_max,
+                          ymin = c(5.5, 1.5, 0.5),
+                          ymax = c(9.5, 5.5, 1.5),
+                          type = c("Sequence",
+                                   "Structure",
+                                   "Electrostatics")),
+            size = 0.0,
+            aes(xmin = xmin, xmax = xmax,
+                ymin = ymin, ymax = ymax,
+                fill = type),
+            alpha = 0.2) + 
+    coord_cartesian(xlim = c(-0.1, x_max), expand = FALSE,
+                    ylim = c(0.5, 9.5)) +
+  annotate("text", x = x_max -0.01, y = 8.0, 
+           label = "Sequence", color = "#DA291CFF",
+           hjust = 1) +
+  annotate("text", x = x_max -0.01, y = 5.0, color = "#53A567FF",
+           label = "Structure", hjust = 1) +
+  annotate("text", x = x_max -0.01, y = 1.0, color = "#56A8CBFF",
+           label = "Electrostatics", hjust = 1)+
+  theme(legend.position = "none") +
+    labs(y = "", x = "Magnitude of LASSO Regression Coefficient",
+       title = "Model Feature Importance", color = "Feature",
+       shape = "Coefficient Sign") +
+  scale_color_manual(values = c("#56A8CBFF","#DA291CFF","#53A567FF" )) +
+  scale_fill_manual(values = c("#56A8CBFF","#DA291CFF","#53A567FF")) +
+  scale_shape_manual(values = c("+" = 21, "−" = 24)))
+```
+
+Let's look at the features going into the model
+```{r}
+(feat_plot <- all_plus_at %>% filter(contig == "bgl_Shen2021") %>%
+  mutate(coord = as.integer(coord)) %>%
+   right_join(combined_bind %>% 
+               rename(coord = bp, new_binding = binding) %>%
+               mutate(coord = as.integer(coord)) %>%
+                                          select(coord, new_binding),
+                                          by = "coord") %>%
+   mutate(binding = new_binding) %>%
+   select(-new_binding) %>%
+  mutate(TA_step = TA_step > 0) %>%
+  mutate(binding = binding > 0 ) %>% 
+  mutate(coord = abs(146 - coord)) %>%
+  pivot_longer(-c(contig, coord), names_to = "feature", values_to = "value") %>%
+  mutate(feature = str_replace(feature,"_", " ")) %>%
+  mutate(feature = str_replace(feature, "lang", "Lang")) %>%
+  mutate(feature = str_replace(feature, "binding", "DBD locations")) %>%
+  filter(feature %in% c("DBD locations", "TA step", "MGW", "EP", "A/T 5bp")) %>%
+  mutate(feature = case_when(feature == "MGW" ~ "Minor Groove Width (Å)",
+                             feature == "EP" ~ "Electrostatic Potential (kT/e)",
+                             feature == "A/T 5bp" ~ "A/T 5bp Window",
+                             TRUE ~ feature)) %>%
+  mutate(feature = fct_relevel(feature,
+                               c("DBD locations",
+                                 "TA step",
+                                 "A/T 5bp Window",
+                                 "Minor Groove Width (Å)",
+                                 "Electrostatic Potential (kT/e)"))) %>%
+  ggplot(aes(x = coord, y = value)) + 
+  facet_wrap(~feature, ncol = 1, scales = "free_y") +
+  geom_col(data = . %>% 
+             filter(feature %in% c("DBD locations", "TA step")), 
+           aes(fill = feature), width = 1) +
+  geom_line(data = . %>% 
+              filter(feature %in% c("A/T 5bp Window", 
+                                    "Minor Groove Width (Å)", 
+                                    "Electrostatic Potential (kT/e)")), 
+            aes(color = feature), size = 1) +
+  theme_classic() + 
+  scale_fill_manual(values = c("black", "#DA291CFF")) +
+  scale_color_manual(values = c("#DA291CFF","#53A567FF", "#56A8CBFF")) +
+  labs(color = "Feature", fill = "Feature", y = "", x = "Coordinate",
+       title = "Key predictors for H-NS DBD binding") +
+  theme(legend.position = "None"))
+```
+
+Defining some helper functions to test the predictive power of the model
+```{r}
+cv_predict <- function(cvfits, datasets, names, coords,  s = "lambda.1se"){
+  Xs <- list()
+  ys <- list()
+  for(d in seq_along(datasets)){
+    this_d <- convert_dataset(datasets[[d]])
+    Xs[[d]] <- this_d$x
+    ys[[d]] <- this_d$y
+  }
+  pred_out <- list()
+  k <- 1
+  for(i in seq_along(Xs)){
+    for(m in seq_along(cvfits)){
+      this_p <- predict(cvfits[[m]], Xs[[i]], type = "response",
+                        s = s)
+      outdf <- data.frame(prob = this_p[,1],
+                          model = as.character(m),
+                          data = names[[i]],
+                          coord = coords[[i]])
+      pred_out[[k]] <- outdf
+      k <- k + 1
+    }
+    pred_out[[k]] <- data.frame(prob = ys[[i]],
+                                model = "actual",
+                                data = names[[i]],
+                                coord = coords[[i]])
+    k <- k + 1
+  }
+  pred_out <- bind_rows(pred_out)
+  pred_out
+}
+
+```
+
+Looking at the predictive power of the model
+```{r}
+preds_shen_at <- cv_predict(list(out_shen_only_at_combined$total), list(shen_at_combined),
+                    c("bglG"),
+                    list(shen_at_combined$coord))
+(model_pred_plot <- preds_shen_at %>%
+    mutate(coord = abs(146 - coord)) %>%
+  mutate(model = if_else(model == "1", "Model Probability of DBD bound", "DBD binding locations")) %>%
+  ggplot(aes(x = coord, y = prob)) + 
+  geom_line(data = . %>% filter(model == "Model Probability of DBD bound"),
+            color = "orange", size = 1) +
+  geom_col(data = .%>% filter(model == "DBD binding locations"),
+           fill = "black", width=1) +
+  labs(x = "Coordinate", y = "") + 
+  ggtitle("H-NS DBD Model Performance") +
+  facet_wrap(~model, ncol = 1, scales = "free_y") +
+  theme_classic())  
+```
+
+Put models together
+```{r, fig.width = 7.5, fig.height= 5.5}
+(P_model <- feat_plot + lcoef_plot + model_pred_plot + plot_spacer() +
+  plot_layout(heights = c(3,1), widths = c(1,1)) +
+  plot_annotation(tag_levels = 'A') & theme_classic(base_size = 9 ) &theme(legend.position = "None"))
+```
+
+```{r}
+ggsave("2022_03_DBD_mod.pdf", plot = P_model, units = "in", 
+       width = 7.5, height = 5.5)
+```
