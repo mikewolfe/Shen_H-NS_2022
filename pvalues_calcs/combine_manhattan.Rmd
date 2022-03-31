@@ -1,0 +1,181 @@
+```{r}
+library(tidyverse)
+theme_set(theme_classic())
+```
+
+
+# Turning the match scores into p-values
+
+Need an offset function to make the center of the DBD in the MD pattern
+```{r}
+offset <- function(data){
+  data %>% mutate(bp = ifelse(direction == "fwd", bp-2, bp + 2))
+}
+```
+
+
+Read in the match scores for each modality and convert first to original
+coordinate system
+```{r}
+FEbabe <- read_tsv("../md_sim_pattern_matching/model_match_1shuff_match_scores.tsv") %>%
+    mutate(method = "Tethered") %>%
+    mutate(bp = bp + 643) %>%
+    offset()
+OH <- read_tsv("../md_sim_pattern_matching/OH_model_match_1shuff_match_scores.tsv") %>%
+    mutate(method = "OH") %>%
+    mutate(bp = bp + 643) %>%
+    offset()
+d <- bind_rows(FEbabe, OH)
+```
+Now let's pull in the shuffled data
+```{r}
+(FEbabe_shuff <- read_tsv("../md_sim_pattern_matching/model_match_1shuff_match_scores_rand.tsv") %>%
+    mutate(bp = bp + 643) %>%
+     separate(direction, sep = "_", into= c("direction", "sample")) %>%
+     offset()
+)
+```
+
+```{r}
+(OH_shuff <- read_tsv("../md_sim_pattern_matching/OH_model_match_1shuff_match_scores_rand.tsv") %>%
+     mutate(bp = bp + 643) %>%
+     separate(direction, sep = "_", into= c("direction", "sample")) %>%
+     offset()
+)
+```
+
+     
+Now we define a function to get the permutation-based pvalue. We did 1000 
+samples and we will add a psuedocount of one to the top and the bottom of the
+denominator to deal with the scores more extreme than all shuffles.
+
+(This is like a prior where you expect 50-50)
+```{r}
+get_p_value <- function(real, sampled){
+    pvals <- list()
+    for(i in seq_along(real$bp)){
+        true_val <- real$match_score[[i]]
+        this_pval <- sampled %>% filter(real$bp[[i]] == bp & real$direction[[i]] == direction) %>%
+            summarize(total = sum(match_score <= true_val)) %>%
+            pull(total)
+        pvals[[i]] <- (this_pval + 1)/(1000 +1)
+    }
+    real %>% mutate(pval = unlist(pvals))
+}
+```
+
+Get the pvalues for each and also convert the coordinate system to the
+new one
+```{r}
+(FEbabe <- get_p_value(FEbabe, FEbabe_shuff) %>%
+    mutate(bp = abs(bp - 756)) %>%
+    mutate(direction = if_else(direction == "fwd", "Reverse", "Forward")))
+```
+
+```{r}
+OH <- get_p_value(OH, OH_shuff) %>%
+    mutate(bp = abs(bp - 756)) %>%
+    mutate(direction = if_else(direction == "fwd", "Reverse", "Forward"))
+```
+
+
+Now plot each individual p-value trace and the combined p-value trace
+```{r}
+(p1 <- FEbabe %>%
+    ggplot(aes(x = bp, y = -log10(pval), color = direction)) + geom_point() + geom_line() +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    scale_color_manual(values = c("#009445", "#1C75BC")) +
+    labs(x = "DRE position (bp)", y = "-log10(pvalue)", title = "TEN-map & MD agreement",
+         color = "DBD\nOrientation"))
+```
+
+```{r}
+tethered_cutoffs <- tibble(md_percentiles = 
+        factor(c(">50%", "<50%", "<10%","<5%", "<2.5%","<1%"), 
+               levels = c(">50%", "<50%", "<10%","<5%", "<2.5%","<1%")),
+        cutoffs = c(Inf, 
+                    quantile(FEbabe_shuff$match_score, 0.50),
+                    quantile(FEbabe_shuff$match_score, 0.10),
+                    quantile(FEbabe_shuff$match_score, 0.05),
+                    quantile(FEbabe_shuff$match_score, 0.025),
+                    quantile(FEbabe_shuff$match_score, 0.01)))
+tethered_cutoffs <- tethered_cutoffs %>% mutate(span = lead(cutoffs))
+head(tethered_cutoffs)
+```
+
+
+```{r}
+FEbabe %>% 
+   ggplot(aes(x = bp, y = match_score, color = direction)) +
+   geom_rect(data = tethered_cutoffs,
+             inherit.aes = FALSE,
+             aes(ymin = span, ymax = cutoffs, 
+                 fill = md_percentiles),
+             xmin = -Inf, xmax = Inf, alpha = 0.8, color = NA) +
+   scale_fill_brewer(palette = "Greys", direction = -1,
+                     guide = guide_legend(ncol=2,
+                                          title.position="top",
+                                          label.position="right")) +
+   geom_point(size = 1) + 
+  geom_line(size = 1) + theme_bw() + 
+     scale_color_manual(values = c("#009445", "#1C75BC"),
+                        guide = guide_legend(ncol=1, 
+                                             title.position = "top",
+                                             label.position = "right")) + 
+     geom_hline(yintercept = 
+                  tethered_cutoffs$cutoffs[tethered_cutoffs$md_percentiles == "<5%"],
+                linetype="dashed") + 
+     labs(title = "TEN-map", y = "MD Match Score",
+          color = "DBD Orientation", x= "DRE position (bp)",
+          fill = "Shuffled Match Score\nPercentiles") +
+   theme(aspect.ratio = 0.3, legend.position = "right")
+```
+
+```{r}
+ggsave("tenmap_md_percentiles_plot.pdf")
+```
+
+```{r}
+(p2 <- OH  %>%
+    ggplot(aes(x = bp, y = -log10(pval), color = direction)) + geom_point() + geom_line() +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    scale_color_manual(values = c("#009445", "#1C75BC")) +
+    labs(x = "DRE position (bp)", y = "-log10(pvalue)", title = "Footprinting & MD agreement",
+         color = "DBD\nOrientation"))
+```
+
+
+
+Combine the two pvalues using Fisher's method
+```{r}
+d <- rbind(FEbabe, OH)
+```
+Get the locations where either method is less than 0.05
+```{r}
+d %>% group_by(bp, direction) %>%
+  summarize(binding = sum(pval < 0.05)) %>%
+  mutate(bp = 145 - bp) %>%
+  write_tsv("combined_individ_binding.tsv")
+```
+
+```{r}
+(p3 <- d %>% group_by(bp, direction) %>%
+    # fishers method for combining pvalues
+    summarize(combined_p = 1-pchisq(-2*sum(log(pval)),4)) %>%
+    ggplot(aes(x = bp, y = -log10(combined_p), color = direction)) + geom_point() +
+    geom_line() +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") + 
+    scale_color_manual(values = c("#009445", "#1C75BC")) +
+    labs(x = "DRE position (bp)", y = "-log10(pvalue)", title = "Combined p-values using Fisher's method",
+         color = "DBD\nOrientation"))
+```
+
+
+```{r, fig.width = 7, fig.height = 7}
+library(patchwork)
+p1/p2/p3
+```
+
+```{r}
+ggsave("match_score_p_value_plots.pdf")
+```
