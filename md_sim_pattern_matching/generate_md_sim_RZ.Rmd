@@ -1,0 +1,46 @@
+```{r}
+library(tidyverse)
+```
+
+```{r}
+d <- read_tsv("md_sim.tsv")
+```
+
+Convert to RZ and plot
+```{r}
+pattern <- d %>% filter(bp <= 15) %>% mutate(rel_cleavage_z = (rel_cleavage
+                                                    - median(rel_cleavage))/mad(rel_cleavage))
+```
+
+```{r}
+pattern %>% ggplot(aes(x = bp, y = rel_cleavage_z, color = strand)) +
+    geom_point() + geom_line() + 
+    theme_bw()
+```
+
+Write out to a file
+```{r}
+pattern %>% select(strand, bp, rel_cleavage_z) %>% arrange(strand, bp) %>%
+    select(rel_cleavage_z) %>%
+    write.table(., file = "pattern_vector_rz.txt", col.names = FALSE,
+                row.names = FALSE)
+```
+
+Same for OH surface calcs
+```{r}
+d_OH <- read_tsv("surface_calc_strand.tsv")
+```
+
+```{r}
+OH_pattern <- d_OH %>% filter(bp <= 15) %>% mutate(Value_z = (Value
+                                                    - median(Value))/mad(Value))
+```
+
+
+```{r}
+OH_pattern %>% select(Strand, bp, Value_z) %>% arrange(Strand, bp) %>%
+    select(Value_z) %>%
+    write.table(., file = "OH_pattern_vector_rz.txt", col.names = FALSE,
+                row.names = FALSE)
+```
+
