@@ -1,0 +1,304 @@
+---
+title: "Ishihama H-NS gSELEX data"
+author: "Mike Wolfe"
+date: "3/20/2022"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, 
+                      warning = FALSE, fig.align = "center")
+```
+
+
+```{r}
+library(tidyverse)
+theme_set(theme_classic())
+```
+
+We wanted to look at whether some of the sequence features that were associated
+with our footprinting data were also associated with the Ishihama H-NS gSELEX
+data.
+
+To perform this analysis, I took the peak centers from Table S1 from their paper
+(https://doi.org/10.1093/femsre/fuab032).
+
+It was unclear from this table or their paper, which *E. coli* K-12 genome their
+coordinates referred to. To determine which coordinates made sense, I checked
+their coordinates and their corresponding annotations for each peak against the
+U00096.3 and U00096.2 genomes. By matching their peak annotations against each
+genome, it appears they used a U00096.2 genome rather than the more recent
+U00096.3 genome.
+
+Since, they do not denote which genome their coordinates are in, this is a best
+guess but manually checking a handful of sites at the end of the genome (where
+coordinates are most impacted by the extra large insertions in U00096.3 compared
+to U00096.2), I can be pretty confident that these are the right sites.
+
+I next took a window of 50 bp on either side of the peak center for a total of
+101 bp for each peak. To make a null set, I randomly sampled the genome for
+a window of the same size for each H-NS peak.
+
+I then used the same scripts I have been using for everything else to calculate
+the locations of TA-steps, A-tracts, the value of a 5 bp windowed A/T content,
+and DNA shape parameters.
+
+## Sequence features
+
+First, I wanted to see if TA-steps or A-tracts were enriched in these H-NS peaks
+compared to the null set.
+
+```{r, include = FALSE}
+d <- read_tsv("tidy_seq_data.tsv.gz")
+head(d)
+```
+
+```{r, include = FALSE}
+d <- d %>% mutate(Site = if_else(str_detect(contig, "RAND", negate = TRUE), "H-NS bound", "Random sites")) %>%
+    mutate(value = value > 0)
+head(d)
+```
+
+```{r, fig.height = 5, fig.width = 7}
+d %>% 
+    group_by(param, contig, Site) %>%
+    summarize(frac_count = sum(value > 0)/n()) %>%
+    ggplot(aes(x = frac_count, fill = Site)) + geom_histogram(position = "identity", alpha = 0.5) +
+    geom_vline(data = . %>% group_by(param, Site) %>% summarize(mean = mean(frac_count, na.rm = TRUE)),
+               aes(xintercept = mean, color = Site), linetype = "dashed") +
+    facet_wrap(~param, scales = "free_y", ncol = 1) +
+    scale_fill_manual(values = c("#DA291CFF", "grey40")) +
+    scale_color_manual(values = c("#DA291CFF", "grey40")) +
+    labs(x = "Fraction of bp in each feature", title = "Enrichment of Sequence Features in H-NS gSELEX sites",
+         subtitle = "Dashed lines indicated means")
+```
+
+We can test for this enrichment using a permutation test by using the difference
+in averages between the two classes as a test statistic, shuffling the labels
+10,000 times, and asking how many shuffled sets had a larger difference in means
+than the actual data. This is a two-sided permutation test.
+```{r}
+perm_test <- function(values, labels, n = 10000) {
+    actual <- abs(mean(values[labels]) - mean(values[!labels]))
+    tests <- numeric(n)
+    for(i in 1:n){
+        shuff_labels <- sample(labels, size = length(labels), replace = FALSE)
+        tests[i] <- abs(mean(values[shuff_labels]) - mean(values[!shuff_labels]) >= actual)
+    }
+    return((sum(tests) + 1)/ (n +1))
+}
+        
+```
+
+```{r}
+d %>% 
+    group_by(param, contig, Site) %>%
+    summarize(frac_count = sum(value > 0)/n()) %>%
+    group_by(param) %>%
+    summarize(perm_pval = perm_test(frac_count, Site == "H-NS bound"))
+```
+
+The permutation test indicates that both features appear to be enriched in H-NS
+sites relative to random locations.
+
+
+## General A/T content
+
+We can also look at the A/T content of the sites. Here I took a 5 bp window to
+look at the A/T content across each site just like I did in the paper.
+```{r, include = FALSE}
+d_at <- read_tsv("Ishihama_windowed_at.tsv.gz")
+head(d_at)
+```
+
+```{r, include = FALSE}
+d_at <- d_at %>% mutate(Site = if_else(str_detect(contig, "RAND", negate = TRUE), "H-NS bound", "Random sites")) 
+head(d_at)
+```
+
+
+First we can look at the overall distribution of each sites 5 bp A/T window
+content
+
+```{r}
+d_at %>% group_by(Site, contig) %>%
+    summarize(avg_at = mean(value)) %>%
+    ggplot(aes(x = avg_at, fill = Site)) + geom_histogram(position = "identity", alpha = 0.5) +
+    geom_vline(data = . %>% group_by(Site) %>% summarize(mean = mean(avg_at, na.rm = TRUE)),
+               aes(xintercept = mean, color = Site), linetype = "dashed") +
+    geom_text(data = . %>% group_by(Site) %>% summarize(mean = mean(avg_at, na.rm = TRUE)) %>%
+                  mutate(adjusted = if_else(Site == "H-NS bound", mean + 0.05, mean - 0.05)),
+              aes(x = adjusted, y = 125, label = sprintf("%.2f", mean), color = Site)) +
+    scale_fill_manual(values = c("#DA291CFF", "grey20")) +
+    scale_color_manual(values = c("#DA291CFF", "grey20")) +
+    labs(x = "Average of A/T content over 5bp windows", title = "Enrichment of Sequence Features in H-NS gSELEX sites",
+         subtitle = "Dashed lines indicated means")
+```
+
+We can get a p-value for the difference in these means using a permutation test
+with shuffled labels like I had above.
+```{r}
+d_at %>% 
+    group_by(contig, Site) %>%
+    summarize(avg_at = mean(value)) %>%
+    ungroup() %>%
+    summarize(perm_pval = perm_test(avg_at, Site == "H-NS bound"))
+```
+The H-NS sites are clearly enriched for 5 bp windowed A/T content over the
+random sites which is not too surprising.
+
+
+## Shape parameters
+
+I also wanted to look at the SHAPE data in a similar manner
+
+```{r, include = FALSE}
+ds <- read_tsv("Ishihama_shape_tidy.tsv.gz")
+head(ds)
+```
+
+
+```{r, include = FALSE}
+ds <- ds %>% mutate(Site = if_else(str_detect(contig, "RAND", negate = TRUE), "H-NS bound", "Random sites"))
+head(ds)
+```
+First let's look at any sort of overall enrichment in either direction for each
+of these SHAPE parameters
+
+```{r}
+ds %>% group_by(param, contig, Site) %>%
+    summarize(avg_value = mean(value, na.rm = TRUE)) %>%
+    ggplot(aes(x = avg_value, fill = Site)) + geom_histogram(position = "identity", alpha = 0.5) +
+    geom_vline(data = . %>% group_by(Site, param) %>% summarize(mean = mean(avg_value, na.rm = TRUE)),
+               aes(xintercept = mean, color = Site), linetype = "dashed") +
+    facet_wrap(~param, scales = "free") +
+    scale_fill_manual(values = c("#53A567FF", "grey40")) +
+    scale_color_manual(values = c("#53A567FF", "grey40")) +
+    labs(title = "Enrichment of each SHAPE feature",
+         x = "Average value of parameter in each site",
+         subtitle = "Dashed lines indicate means")
+        
+```
+
+Now lets do a two-sided permutation test for these features. 
+
+```{r}
+ds %>% 
+    group_by(contig, Site, param) %>%
+    summarize(avg_val = mean(value, na.rm = TRUE)) %>%
+    group_by(param) %>%
+    summarize(perm_pval = perm_test(avg_val, Site == "H-NS bound"))
+```
+Each of thes shape features show a statistically significant difference between
+the H-NS sites and the random sites. However, the magnitude of these changes is
+pretty small for some of the SHAPE features. For example, Roll clearly seems to
+just have higher variation in values in the H-NS sites compared to the random
+sites rather than a shift in the average from looking at the distributions.
+
+
+## Putting it all together for the paper.
+
+The general conclusions I get out of this analysis is that each of the
+features we identified in our logistic regression model as important
+for H-NS DBD binding seem to be enriched in the gSELEX sites compared to
+random sites across the genome.
+
+Here, I put together the most relevant information from this analysis into a
+figure we use for the paper. I chose the features that were chosen
+by our LASSO regression to focus on.
+
+```{r}
+library(patchwork)
+```
+
+
+
+```{r}
+ta_den <- d %>% filter(param == "TA_step") %>%
+    group_by(Site, contig) %>% summarize(frac_count = sum(value > 0) / n()) %>%
+    ggplot(aes(x = frac_count, fill = Site)) + geom_histogram(alpha = 0.5, position = "identity") +
+    geom_vline(data = . %>% group_by(Site) %>% summarize(mean = mean(frac_count, na.rm = TRUE)),
+               aes(xintercept = mean, color = Site), linetype = "dashed") +
+     theme_classic() +
+     theme(legend.position = "none") +
+     scale_fill_manual(values = c("#DA291CFF", "grey40")) +
+     scale_color_manual(values = c("#DA291CFF", "grey40")) +
+    labs(x = "Fraction of bp in TA step per site", title = "TA step")
+
+at_den <- d_at %>% filter(param == "A/T_5bp") %>%
+    group_by(Site, contig) %>% summarize(avg_at = mean(value)) %>%
+    ggplot(aes(x = avg_at, fill = Site)) + geom_histogram(alpha = 0.5, position = "identity") +
+    geom_vline(data = . %>% group_by(Site) %>% summarize(mean = mean(avg_at, na.rm = TRUE)),
+               aes(xintercept = mean, color = Site), linetype = "dashed") +
+     theme_classic() +
+    theme(legend.position = "none") +
+     scale_fill_manual(values = c("#DA291CFF", "grey40")) +
+     scale_color_manual(values = c("#DA291CFF", "grey40")) +
+    labs(x = "Average 5 bp A/T content per site", title = "A/T content")
+
+mgw_den <- ds %>% filter(param == "MGW") %>%
+    group_by(Site, contig) %>% summarize(avg = mean(value, na.rm = TRUE)) %>%
+    ggplot(aes(x = avg, fill = Site)) + geom_histogram(alpha = 0.5, position = "identity") +
+    geom_vline(data = . %>% group_by(Site) %>% summarize(mean = mean(avg, na.rm = TRUE)),
+               aes(xintercept = mean, color = Site), linetype = "dashed") +
+     theme_classic() +
+    theme(legend.position = "none") +
+     scale_fill_manual(values = c("#53A567FF", "grey40")) +
+     scale_color_manual(values = c("#53A567FF", "grey40")) +
+    labs(x = "Average MGW (Å) per site", title = "Minor Groove Width (Å)")
+
+ep_den <- ds %>% filter(param == "EP") %>%
+    group_by(Site, contig) %>% summarize(avg = mean(value, na.rm = TRUE)) %>%
+    ggplot(aes(x = avg, fill = Site)) + geom_histogram(alpha = 0.5, position = "identity") +
+    geom_vline(data = . %>% group_by(Site) %>% summarize(mean = mean(avg, na.rm = TRUE)),
+               aes(xintercept = mean, color = Site), linetype = "dashed") +
+     theme_classic() +
+    theme(legend.position = "none") +
+     scale_fill_manual(values = c("#56A8CBFF", "grey40")) +
+     scale_color_manual(values = c("#56A8CBFF", "grey40")) +
+    labs(x = "Average EP (kT/e) per site", title = "Electrostatic Potential (kT/e)")
+```
+
+For these plots, the gray is the random sites and the colors are the H-NS sites.
+
+```{r, fig.width = 8, fig.height = 5}
+(ta_den + at_den + mgw_den + ep_den) + plot_annotation(tag_levels = 'A', tag_suffix= '.')
+```
+
+```{r}
+ggsave("Ishihama_feature_enrichment.pdf", height = 5.0, width = 8.0, units = "in")
+```
+
+    
+Get averages the requisite averages as well
+```{r}
+d_at %>% filter(param == "A/T_5bp") %>%
+    group_by(Site, contig) %>% summarize(avg_at = mean(value)) %>%
+    group_by(Site) %>%
+    summarize(mean(avg_at))
+```
+
+
+```{r}
+ds %>% filter(param == "MGW") %>%
+    group_by(Site, contig) %>% summarize(avg = mean(value, na.rm = TRUE)) %>%
+    group_by(Site) %>%
+    summarize(mean(avg))
+```
+
+```{r}
+ds %>% filter(param == "EP") %>%
+    group_by(Site, contig) %>% summarize(avg = mean(value, na.rm = TRUE)) %>%
+    group_by(Site) %>%
+    summarize(mean(avg))
+```
+
+```{r}
+d %>% filter(param == "TA_step") %>%
+    group_by(Site, contig) %>% summarize(frac_count = sum(value > 0) / n()) %>%
+    group_by(Site) %>%
+    summarize(mean(frac_count))
+```
+
+

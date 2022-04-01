@@ -1,0 +1,18 @@
+```{r}
+library(tidyverse)
+```
+
+```{r}
+d <- read_tsv("FEMSRE_binding_sites.txt")
+head(d)
+```
+
+
+```{r}
+d %>% mutate(chrm = "U00096.2", start = `Peak center` - 50, end = `Peak center` + 51, name = "H-NS bound", value = ".", strand = "+") %>%
+    select(-`Peak center`) %>%
+    write_tsv("Ishihama_H-NS_sites.bed", col_names = FALSE)
+```
+
+
+
